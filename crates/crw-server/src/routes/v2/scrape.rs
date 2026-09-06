@@ -81,6 +81,14 @@ pub struct V2ScrapeRequest {
     /// raw. See [`crw_core::types::ParserSpec`].
     #[serde(default)]
     pub parsers: Option<Vec<crw_core::types::ParserSpec>>,
+    /// Optional sticky user identity (crw extension, same semantics as v1
+    /// `userId`). Must match `^[A-Za-z0-9._-]+$` (validated in `to_internal`).
+    #[serde(default, alias = "user_id")]
+    pub user_id: Option<String>,
+    /// Optional sticky session (crw extension, same semantics as v1
+    /// `sessionId`). Only takes effect together with `user_id`.
+    #[serde(default, alias = "session_id")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +181,9 @@ pub(crate) fn to_internal(
         headers.insert("Accept-Language".to_string(), accept_language);
     }
 
+    let (user_id, session_id) =
+        crw_core::types::validate_identity_pair(v2.user_id.as_deref(), v2.session_id.as_deref())?;
+
     let req = ScrapeRequest {
         url: v2.url,
         formats: decomposed.formats.clone(),
@@ -181,6 +192,8 @@ pub(crate) fn to_internal(
         exclude_tags: v2.exclude_tags,
         wait_for: v2.wait_for,
         headers,
+        user_id,
+        session_id,
         json_schema: decomposed.json_schema.clone(),
         // A `{"type":"json","prompt":...}` format object carries the extraction
         // instruction; it reaches the LLM only via `extract.prompt`.
@@ -435,6 +448,35 @@ mod tests {
         let v2: V2ScrapeRequest = serde_json::from_value(body).unwrap();
         let (req, _, _) = to_internal(v2).unwrap();
         assert_eq!(req.render_js, None);
+    }
+
+    #[test]
+    fn v2_scrape_threads_identity_to_internal() {
+        let body = serde_json::json!({
+            "url": "http://example.com",
+            "userId": "home-alice",
+            "sessionId": "sess-1",
+        });
+        let v2: V2ScrapeRequest = serde_json::from_value(body).unwrap();
+        let (req, _, _) = to_internal(v2).unwrap();
+        assert_eq!(req.user_id.as_deref(), Some("home-alice"));
+        assert_eq!(req.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn v2_scrape_identity_defaults_to_none_and_rejects_allowlist_violations() {
+        let body = serde_json::json!({ "url": "http://example.com" });
+        let v2: V2ScrapeRequest = serde_json::from_value(body).unwrap();
+        let (req, _, _) = to_internal(v2).unwrap();
+        assert_eq!(req.user_id, None);
+        assert_eq!(req.session_id, None);
+
+        let body = serde_json::json!({
+            "url": "http://example.com",
+            "userId": "bad/user",
+        });
+        let v2: V2ScrapeRequest = serde_json::from_value(body).unwrap();
+        assert!(to_internal(v2).is_err());
     }
 
     fn minimal_doc() -> V2Document {

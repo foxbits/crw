@@ -102,6 +102,11 @@ pub async fn start_batch(
     // Reject an unavailable pinned renderer up front (as /v1/scrape and /v1/crawl
     // do) instead of failing every URL individually deep in the pipeline.
     crate::state::validate_renderer_pin(template.renderer, template.render_js, &state)?;
+    // Same for sticky identity: fail the batch once, not per URL in `scrape_url`.
+    crw_core::types::validate_identity_pair(
+        template.user_id.as_deref(),
+        template.session_id.as_deref(),
+    )?;
     template.url = String::new();
 
     // Partition URLs into valid / invalid (SSRF-checked, same guard as

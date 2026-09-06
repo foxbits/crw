@@ -110,6 +110,38 @@ tokio::task_local! {
     pub static REQUEST_SCREENSHOT: Option<ScreenshotReq>;
 }
 
+tokio::task_local! {
+    /// Per-request user identity (`ScrapeRequest.user_id` /
+    /// `CrawlRequest.user_id`). A generic, renderer-agnostic channel for
+    /// linking session details on a stateless server: set by
+    /// `single::scrape_url` / `crawl::run_crawl` after trim + validation;
+    /// `None` = no sticky identity. Consuming tiers decide what stickiness
+    /// means for them (see the tier's own docs).
+    pub static REQUEST_USER_ID: Option<String>;
+}
+
+tokio::task_local! {
+    /// Per-request session identity (`ScrapeRequest.session_id` /
+    /// `CrawlRequest.session_id`). Same generic channel as
+    /// [`REQUEST_USER_ID`]: it only takes effect together with a user
+    /// identity, otherwise consumers treat the request as having no sticky
+    /// identity at all. Mirrors [`REQUEST_USER_ID`] to avoid
+    /// `PageFetcher::fetch` signature churn.
+    pub static REQUEST_SESSION_ID: Option<String>;
+}
+
+/// Read the sticky user for the current task. `None` outside a scope or when
+/// the request omitted `user_id`.
+pub fn current_user_id() -> Option<String> {
+    REQUEST_USER_ID.try_with(|v| v.clone()).ok().flatten()
+}
+
+/// Read the sticky session for the current task. `None` outside a scope or
+/// when the request omitted `session_id`.
+pub fn current_session_id() -> Option<String> {
+    REQUEST_SESSION_ID.try_with(|v| v.clone()).ok().flatten()
+}
+
 /// Attach the browser-context pool to a CDP tier, when enabled and supported.
 ///
 /// Every pooled tier gets its own pool, sized from the shared

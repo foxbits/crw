@@ -158,11 +158,32 @@ fn push_failed_page(
 
 /// Run a BFS crawl starting from a URL.
 pub async fn run_crawl(opts: CrawlOptions<'_>) {
-    // Propagate crawl-level country to every page-fetch through the renderer
-    // stack via the same task-local used by `single::scrape_url`.
+    // Propagate crawl-level country + sticky identity to every page-fetch
+    // through the renderer stack via the same task-locals used by
+    // `single::scrape_url`. Identity is validated once here (not per page);
+    // invalid values fail the whole job via `send_failed`
     let country = opts.req.country.clone();
+    let (user, session) = match crw_core::types::validate_identity_pair(
+        opts.req.user_id.as_deref(),
+        opts.req.session_id.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let CrawlOptions { id, state_tx, .. } = opts;
+            send_failed(id, &state_tx, format!("{e}"));
+            return;
+        }
+    };
     crw_renderer::REQUEST_COUNTRY
-        .scope(country, run_crawl_inner(opts))
+        .scope(country, async move {
+            crw_renderer::REQUEST_USER_ID
+                .scope(user, async move {
+                    crw_renderer::REQUEST_SESSION_ID
+                        .scope(session, run_crawl_inner(opts))
+                        .await
+                })
+                .await
+        })
         .await
 }
 

@@ -151,6 +151,8 @@ pub async fn run(mut args: CrawlArgs) -> Result<(), CmdError> {
         wait_for: None,
         renderer: None,
         country: None,
+        user_id: None,
+        session_id: None,
         proxy_list: Vec::new(),
         proxy_rotation: None,
         // No CLI flag for per-request headers, same as `crw scrape`.

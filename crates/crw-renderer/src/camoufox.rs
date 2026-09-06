@@ -11,7 +11,7 @@
 //! reached over the sidecar's HTTP API instead of the [`crate::cdp`] path. The
 //! renderer is a plain [`reqwest::Client`] — it never touches `cdp.rs`.
 //!
-//! ## Sequence (per request, fresh session — no cookie carry-over)
+//! ## Sequence (fresh session by default — no cookie carry-over)
 //! 1. `POST {base}/tabs` `{userId, sessionKey, url}` → `{tabId, url}` (the
 //!    `url` body navigates the new tab as it is created).
 //! 2. `POST {base}/tabs/{tabId}/wait` `{userId, timeout}` → `{ok, ready}`
@@ -23,9 +23,16 @@
 //!    `expression = "document.documentElement.outerHTML"` → `{ok, result}`.
 //!    `result` is the fully JS-rendered DOM string — exactly what CRW's
 //!    post-render pipeline (`only_main_content`, tag filters, markdown) needs.
-//! 4. `DELETE {base}/sessions/{userId}` — ALWAYS, even on error, so the sidecar
-//!    never leaks a server-side session.
+//! 4. `DELETE {base}/sessions/{userId}` — ALWAYS on the ephemeral path, even on
+//!    error, so the sidecar never leaks a server-side session. SKIPPED only
+//!    when the request carried BOTH a sticky `user_id` and `session_id`:
+//!    persistence is keyed by the pair, so teardown would defeat reuse.
+//!    A lone `session_id` without `user_id` stays ephemeral (randomized + teardown).
 //!
+//! Sticky identity arrives via the generic `REQUEST_USER_ID` /
+//! `REQUEST_SESSION_ID` task-locals (set from `ScrapeRequest.user_id` /
+//! `session_id`). Absent ⇒ per-request `crw_` / `task_` random IDs (today's
+//! behavior, byte-identical).
 //! The endpoint contract above is from the camofox-browser `openapi.json`.
 
 use async_trait::async_trait;
@@ -171,6 +178,8 @@ impl CamoufoxRenderer {
             tracing::debug!(
                 renderer = %self.name,
                 attempt,
+                user_id,
+                session_id = session_key,
                 "camoufox create tab returned no tabId, retrying"
             );
         }
@@ -223,6 +232,7 @@ impl CamoufoxRenderer {
             tracing::debug!(
                 renderer = %self.name,
                 tab_id,
+                user_id,
                 "skipping camoufox wait: deadline exhausted (fail-open)"
             );
             return;
@@ -246,6 +256,7 @@ impl CamoufoxRenderer {
                     tracing::debug!(
                         renderer = %self.name,
                         tab_id,
+                        user_id,
                         ok,
                         ready,
                         "camoufox wait settled without ready (fail-open, proceeding to evaluate)"
@@ -255,6 +266,7 @@ impl CamoufoxRenderer {
             Err(e) => tracing::warn!(
                 renderer = %self.name,
                 tab_id,
+                user_id,
                 "camoufox wait failed (fail-open, proceeding to evaluate): {e}"
             ),
         }
@@ -308,10 +320,11 @@ impl CamoufoxRenderer {
         }
     }
 
-    /// Full create → wait → evaluate sequence with GUARANTEED cleanup. The inner
-    /// result is bound first, then `destroy_session` runs at statement level so
-    /// it fires on both the Ok and Err paths, and only afterward is the result
-    /// returned.
+    /// Full create → wait → evaluate sequence with GUARANTEED cleanup on the
+    /// ephemeral path. The inner result is bound first, then `destroy_session`
+    /// runs at statement level so it fires on both the Ok and Err paths, and
+    /// only afterward is the result returned. When `persist` is true teardown is
+    /// skipped entirely so the sidecar context survives for the next scrape.
     async fn run_sequence(
         &self,
         url: &str,
@@ -319,11 +332,14 @@ impl CamoufoxRenderer {
         session_key: &str,
         wait_for_ms: Option<u64>,
         deadline: &Deadline,
+        persist: bool,
     ) -> CrwResult<(u16, String)> {
         let inner = self
             .run_sequence_inner(url, user_id, session_key, wait_for_ms, deadline)
             .await;
-        self.destroy_session(user_id).await;
+        if !persist {
+            self.destroy_session(user_id).await;
+        }
         inner
     }
 
@@ -393,10 +409,28 @@ impl PageFetcher for CamoufoxRenderer {
             return Err(CrwError::Timeout(deadline.requested_ms()));
         }
         let start = Instant::now();
-        let user_id = Self::rand_id("crw_");
-        let session_key = Self::rand_id("task_");
+        // Sticky identity from the request. Persistence requires BOTH
+        // `user_id` and `session_id`: a lone `session_id` without `user_id` is
+        // downgraded to fully-ephemeral (randomized + teardown) so it can
+        // neither persist nor leak a sidecar slot per request. Absent ⇒ fresh
+        let user_opt = crate::current_user_id();
+        let session_opt = crate::current_session_id();
+        let persist = user_opt.is_some() && session_opt.is_some();
+        let user_id = user_opt.unwrap_or_else(|| Self::rand_id("crw_"));
+        let session_key = if persist {
+            session_opt.unwrap_or_else(|| Self::rand_id("task_"))
+        } else {
+            Self::rand_id("task_")
+        };
+        tracing::debug!(
+            renderer = %self.name,
+            user_id = %user_id,
+            session_id = %session_key,
+            persist,
+            "camoufox fetch starting"
+        );
         let (status, html) = self
-            .run_sequence(url, &user_id, &session_key, wait_for_ms, &deadline)
+            .run_sequence(url, &user_id, &session_key, wait_for_ms, &deadline, persist)
             .await?;
 
         Ok(FetchResult {
@@ -1017,5 +1051,198 @@ mod tests {
             .expect_err("tiny deadline should error");
         assert!(matches!(err, CrwError::Timeout(_)));
         // server drop verifies cleanup expect(1) despite the exhausted deadline
+    }
+
+    use wiremock::matchers::body_string_contains;
+
+    /// Mount wait + evaluate for a tab, asserting BOTH carry the sticky
+    /// `userId` in their JSON bodies (not just `POST /tabs`). A regression
+    /// that forwards the sticky ID to create but uses a random one for
+    /// wait/evaluate would fail these matchers.
+    async fn mount_success_path_with_user(server: &MockServer, tab_id: &str, user_id: &str) {
+        Mock::given(method("POST"))
+            .and(path(format!("/tabs/{tab_id}/wait")))
+            .and(body_string_contains(user_id))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "ready": true
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/tabs/{tab_id}/evaluate")))
+            .and(body_string_contains(user_id))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": "<html><body>sticky session content here</body></html>"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sticky_ids_are_forwarded_and_cleanup_is_skipped() {
+        let server = MockServer::start().await;
+        // Sticky IDs must reach the sidecar verbatim in POST /tabs.
+        Mock::given(method("POST"))
+            .and(path("/tabs"))
+            .and(body_string_contains("home-alice"))
+            .and(body_string_contains("sess-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tabId": "t1", "url": "https://example.com"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The same sticky user must flow into wait + evaluate, not just create.
+        mount_success_path_with_user(&server, "t1", "home-alice").await;
+        // userId + sessionId present ⇒ NO teardown, so the context survives.
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/sessions/.+"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let r = renderer(&server.uri());
+        let res = crate::REQUEST_USER_ID
+            .scope(Some("home-alice".to_string()), async {
+                crate::REQUEST_SESSION_ID
+                    .scope(Some("sess-1".to_string()), async {
+                        r.fetch("https://example.com", &HashMap::new(), None, deadline())
+                            .await
+                    })
+                    .await
+            })
+            .await
+            .expect("sticky fetch should succeed");
+        assert!(res.html.contains("sticky session"));
+        // server drop verifies DELETE expect(0) + POST /tabs + wait + evaluate
+    }
+
+    #[tokio::test]
+    async fn sticky_user_without_session_still_cleans_up() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tabs"))
+            .and(body_string_contains("home-bob"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tabId": "t1", "url": "https://example.com"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_success_path_with_user(&server, "t1", "home-bob").await;
+        // No sessionId ⇒ ephemeral path: teardown must still fire once.
+        Mock::given(method("DELETE"))
+            .and(path("/sessions/home-bob"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let r = renderer(&server.uri());
+        let res = crate::REQUEST_USER_ID
+            .scope(Some("home-bob".to_string()), async {
+                crate::REQUEST_SESSION_ID
+                    .scope(None, async {
+                        r.fetch("https://example.com", &HashMap::new(), None, deadline())
+                            .await
+                    })
+                    .await
+            })
+            .await
+            .expect("fetch should succeed");
+        assert!(res.html.contains("sticky session"));
+    }
+
+    #[tokio::test]
+    async fn session_without_user_stays_ephemeral() {
+        // A lone `session_id` without `user_id` is downgraded to
+        // fully-ephemeral: randomized IDs + teardown. Key observable: cleanup
+        // MUST fire (the old buggy behavior skipped it, leaking one sidecar
+        // slot per request with zero persistence benefit).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tabs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tabId": "t1", "url": "https://example.com"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_wait_ok(&server, "t1").await;
+        Mock::given(method("POST"))
+            .and(path("/tabs/t1/evaluate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": "<html><body>lonely session content here</body></html>"
+            })))
+            .mount(&server)
+            .await;
+        // Random `crw_` user ⇒ teardown fires against a random path.
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/sessions/crw_.+"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let r = renderer(&server.uri());
+        let res = crate::REQUEST_USER_ID
+            .scope(None, async {
+                crate::REQUEST_SESSION_ID
+                    .scope(Some("sess-lonely".to_string()), async {
+                        r.fetch("https://example.com", &HashMap::new(), None, deadline())
+                            .await
+                    })
+                    .await
+            })
+            .await
+            .expect("fetch should succeed");
+        assert!(res.html.contains("lonely session"));
+        // server drop verifies DELETE expect(1) on the random crw_ path
+    }
+
+    #[tokio::test]
+    async fn sticky_session_skips_cleanup_even_on_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tabs"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tabId": "t1"})),
+            )
+            .mount(&server)
+            .await;
+        mount_wait_ok(&server, "t1").await;
+        Mock::given(method("POST"))
+            .and(path("/tabs/t1/evaluate"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({"error": "boom"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/sessions/.+"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let r = renderer(&server.uri());
+        let err = crate::REQUEST_USER_ID
+            .scope(Some("home-alice".to_string()), async {
+                crate::REQUEST_SESSION_ID
+                    .scope(Some("sess-9".to_string()), async {
+                        r.fetch("https://example.com", &HashMap::new(), None, deadline())
+                            .await
+                    })
+                    .await
+            })
+            .await
+            .expect_err("evaluate 500 should error");
+        assert!(matches!(err, CrwError::RendererError(_)));
+        // server drop verifies DELETE expect(0) even on the error path
     }
 }

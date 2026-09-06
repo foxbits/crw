@@ -203,6 +203,14 @@ pub fn tool_definitions(proxy_mode: bool) -> Value {
                         "type": "string",
                         "enum": ["auto", "lightpanda", "chrome", "playwright", "camoufox"],
                         "description": "Pin renderer; non-auto hard-pins and implies renderJs:true (default auto). 'camoufox' requires the server's opt-in camoufox tier to be configured."
+                    },
+                    "userId": {
+                        "type": "string",
+                        "description": "Sticky user id (omit=fresh)"
+                    },
+                    "sessionId": {
+                        "type": "string",
+                        "description": "Sticky session id, needs userId (omit=fresh)"
                     }
                 },
                 "required": ["url"]
@@ -252,6 +260,14 @@ pub fn tool_definitions(proxy_mode: bool) -> Value {
                         "type": "string",
                         "enum": ["auto", "lightpanda", "chrome", "playwright", "camoufox"],
                         "description": "Pin renderer; non-auto hard-pins and implies renderJs:true (default auto). 'camoufox' requires the server's opt-in camoufox tier to be configured."
+                    },
+                    "userId": {
+                        "type": "string",
+                        "description": "Sticky user id (omit=fresh)"
+                    },
+                    "sessionId": {
+                        "type": "string",
+                        "description": "Sticky session id, needs userId (omit=fresh)"
                     }
                 },
                 "required": ["url"]
@@ -1048,9 +1064,11 @@ mod tests {
     /// full 8-tool list was ~8017 bytes (~2673 est-tok). The canonical lifecycle
     /// adds one cancel tool plus required output schemas for start/status/cancel;
     /// after closing lifecycle statuses and typing every per-URL result field,
-    /// the 9-tool list is ~10705 bytes (~3569 est-tok). The ceiling keeps ~2%
-    /// headroom so further growth still fails.
-    const TOOLS_LIST_TOKEN_CEILING: usize = 3650;
+    /// the 9-tool list is ~10705 bytes (~3569 est-tok).
+    // Sticky identity (`userId`/`sessionId` on `crw_scrape` + `crw_crawl`, short descriptions)
+    // brings the 9-tool list to ~11300 bytes (~3770 est-tok).
+    // The ceiling keeps ~2% headroom over that so further growth still fails.
+    const TOOLS_LIST_TOKEN_CEILING: usize = 3820;
 
     #[test]
     fn tools_list_token_budget() {
@@ -1161,6 +1179,34 @@ mod tests {
         assert!(enum_vals.iter().any(|v| v == "auto"));
         assert!(enum_vals.iter().any(|v| v == "playwright"));
         assert!(enum_vals.iter().any(|v| v == "camoufox"));
+    }
+
+    #[test]
+    fn crw_scrape_schema_advertises_optional_identity() {
+        let defs = tool_definitions(false);
+        let scrape = tool_by_name(&defs, "crw_scrape");
+        let props = &scrape["inputSchema"]["properties"];
+        assert_eq!(props["userId"]["type"], "string");
+        assert_eq!(props["sessionId"]["type"], "string");
+        let required = scrape["inputSchema"]["required"]
+            .as_array()
+            .expect("required array");
+        assert!(!required.iter().any(|v| v == "userId"));
+        assert!(!required.iter().any(|v| v == "sessionId"));
+    }
+
+    #[test]
+    fn crw_crawl_schema_advertises_optional_identity() {
+        let defs = tool_definitions(false);
+        let crawl = tool_by_name(&defs, "crw_crawl");
+        let props = &crawl["inputSchema"]["properties"];
+        assert_eq!(props["userId"]["type"], "string");
+        assert_eq!(props["sessionId"]["type"], "string");
+        let required = crawl["inputSchema"]["required"]
+            .as_array()
+            .expect("required array");
+        assert!(!required.iter().any(|v| v == "userId"));
+        assert!(!required.iter().any(|v| v == "sessionId"));
     }
 
     #[test]

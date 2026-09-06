@@ -50,6 +50,8 @@ fn request(url: String) -> CrawlRequest {
         wait_for: None,
         renderer: None,
         country: None,
+        user_id: None,
+        session_id: None,
         proxy_list: Vec::new(),
         proxy_rotation: None,
         headers: std::collections::HashMap::new(),

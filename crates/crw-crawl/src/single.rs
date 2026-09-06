@@ -60,6 +60,10 @@ pub async fn scrape_url(
     // renderer stack via task-locals. `REQUEST_COUNTRY` drives DataImpulse
     // credential country; `REQUEST_PROXY` carries the resolved proxy (BYOP >
     // config) so BOTH the HTTP and JS/CDP paths egress through the same entry.
+    // Identity first so a malformed `userId`/`sessionId` 400s deterministically
+    // instead of being masked by a proxy-resolution error.
+    let (sticky_user, sticky_session) =
+        crw_core::types::validate_identity_pair(req.user_id.as_deref(), req.session_id.as_deref())?;
     let resolved_proxy = resolve_request_proxy(req, renderer)?;
     // `REQUEST_SCREENSHOT` carries the (out-of-band) screenshot params into the
     // renderer stack so the CDP path can capture without trait-signature churn
@@ -72,21 +76,29 @@ pub async fn scrape_url(
             });
     let result = crw_renderer::REQUEST_COUNTRY
         .scope(req.country.clone(), async move {
-            crw_renderer::REQUEST_PROXY
-                .scope(resolved_proxy, async move {
-                    crw_renderer::REQUEST_SCREENSHOT
-                        .scope(screenshot_req, async move {
-                            scrape_url_inner(
-                                req,
-                                renderer,
-                                llm_config,
-                                extraction_cfg,
-                                user_agent,
-                                default_stealth,
-                                render_js_default,
-                                deadline,
-                            )
-                            .await
+            crw_renderer::REQUEST_USER_ID
+                .scope(sticky_user, async move {
+                    crw_renderer::REQUEST_SESSION_ID
+                        .scope(sticky_session, async move {
+                            crw_renderer::REQUEST_PROXY
+                                .scope(resolved_proxy, async move {
+                                    crw_renderer::REQUEST_SCREENSHOT
+                                        .scope(screenshot_req, async move {
+                                            scrape_url_inner(
+                                                req,
+                                                renderer,
+                                                llm_config,
+                                                extraction_cfg,
+                                                user_agent,
+                                                default_stealth,
+                                                render_js_default,
+                                                deadline,
+                                            )
+                                            .await
+                                        })
+                                        .await
+                                })
+                                .await
                         })
                         .await
                 })

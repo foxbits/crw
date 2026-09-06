@@ -697,6 +697,100 @@ async fn mcp_crw_crawl_renderer_unavailable_returns_tool_error() {
 }
 
 #[tokio::test]
+async fn mcp_tools_list_advertises_optional_identity() {
+    let server = test_app_with_search();
+    let resp = server
+        .post("/mcp")
+        .content_type("application/json")
+        .json(&mcp_request("tools/list", json!(7), json!({})))
+        .await;
+    resp.assert_status_ok();
+    let json: serde_json::Value = resp.json();
+    let tools = json["result"]["tools"].as_array().unwrap();
+    for name in ["crw_scrape", "crw_crawl"] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} tool"));
+        let props = &tool["inputSchema"]["properties"];
+        assert_eq!(props["userId"]["type"], "string", "{name} userId");
+        assert_eq!(props["sessionId"]["type"], "string", "{name} sessionId");
+        let required = tool["inputSchema"]["required"].as_array().unwrap();
+        assert!(
+            !required.iter().any(|v| v == "userId"),
+            "{name} userId optional"
+        );
+        assert!(
+            !required.iter().any(|v| v == "sessionId"),
+            "{name} sessionId optional"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_crw_scrape_rejects_identity_with_path_separator() {
+    // Sticky identity containing '/' must fail as a tool error (not a generic
+    // "invalid arguments" deserialization failure): deserialization accepts
+    // the strings, `scrape_url` validation rejects them.
+    let server = test_app();
+    let resp = server
+        .post("/mcp")
+        .content_type("application/json")
+        .json(&mcp_request(
+            "tools/call",
+            json!(101),
+            json!({
+                "name": "crw_scrape",
+                "arguments": {
+                    "url": "https://example.com",
+                    "userId": "bad/user",
+                    "sessionId": "sess-1"
+                }
+            }),
+        ))
+        .await;
+    resp.assert_status_ok();
+    let json: serde_json::Value = resp.json();
+    let result = &json["result"];
+    assert_eq!(result["isError"], true);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("'userId' must match"),
+        "expected identity validation error, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_crw_crawl_rejects_identity_with_path_separator() {
+    let server = test_app();
+    let resp = server
+        .post("/mcp")
+        .content_type("application/json")
+        .json(&mcp_request(
+            "tools/call",
+            json!(102),
+            json!({
+                "name": "crw_crawl",
+                "arguments": {
+                    "url": "https://example.com",
+                    "userId": "home-alice",
+                    "sessionId": "bad\\sess"
+                }
+            }),
+        ))
+        .await;
+    resp.assert_status_ok();
+    let json: serde_json::Value = resp.json();
+    let result = &json["result"];
+    assert_eq!(result["isError"], true);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("'sessionId' must match"),
+        "expected identity validation error, got: {text}"
+    );
+}
+
+#[tokio::test]
 async fn mcp_missing_method_field() {
     let server = test_app();
     let body = json!({

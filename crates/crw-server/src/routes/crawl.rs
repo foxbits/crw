@@ -49,6 +49,8 @@ pub async fn start_crawl(
         .map_err(CrwError::InvalidRequest)?;
 
     validate_crawl_renderer(&req, &state)?;
+    // Fail fast on a sticky identity that is invalid.
+    crw_core::types::validate_identity_pair(req.user_id.as_deref(), req.session_id.as_deref())?;
 
     let id = state.start_crawl_job(req).await;
 

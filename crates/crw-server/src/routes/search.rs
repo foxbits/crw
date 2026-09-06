@@ -1510,6 +1510,8 @@ async fn enrich_with_scrape(
                 proxy_list: Vec::new(),
                 proxy_rotation: None,
                 country,
+                user_id: None,
+                session_id: None,
                 stealth: None,
                 actions: None,
                 extract: None,

@@ -76,6 +76,11 @@ async fn call_tool_inner(state: &AppState, tool_name: &str, args: Value) -> Resu
                 serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))?;
             validate_url(&req.url).await?;
             validate_crawl_renderer(&req, state).map_err(|e| format!("{e}"))?;
+            crw_core::types::validate_identity_pair(
+                req.user_id.as_deref(),
+                req.session_id.as_deref(),
+            )
+            .map_err(|e| format!("{e}"))?;
             let id = state.start_crawl_job(req).await;
             Ok(json!({"success": true, "id": id.to_string()}))
         }

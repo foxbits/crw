@@ -50,6 +50,14 @@ pub struct V2CrawlRequest {
     pub renderer: Option<RequestedRenderer>,
     #[serde(default)]
     pub country: Option<String>,
+    /// Optional sticky user identity (crw extension, same semantics as v1
+    /// `userId`). Also accepted nested under `scrapeOptions`; top-level wins.
+    #[serde(default, alias = "user_id")]
+    pub user_id: Option<String>,
+    /// Optional sticky session (crw extension, same semantics as v1
+    /// `sessionId`). Only takes effect together with `user_id`.
+    #[serde(default, alias = "session_id")]
+    pub session_id: Option<String>,
     /// BYOP proxy pool (crw extension), rotated per `proxy_rotation`. Accepts the
     /// snake_case `proxy_list` alias (what the managed layer injects).
     #[serde(default, alias = "proxy_list")]
@@ -154,6 +162,24 @@ pub async fn start_crawl(
         .map_err(CrwError::InvalidRequest)?;
 
     let opts = scrape_opts_to_internal(&v2.scrape_options)?;
+    // Sticky identity: explicit top-level wins, else nested `scrapeOptions`
+    // (mirrors v1 `lift_scrape_options` so both shapes keep working).
+    let nested_user = v2
+        .scrape_options
+        .as_ref()
+        .and_then(|v| v.get("userId").or_else(|| v.get("user_id")))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let nested_session = v2
+        .scrape_options
+        .as_ref()
+        .and_then(|v| v.get("sessionId").or_else(|| v.get("session_id")))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let (user_id, session_id) = crw_core::types::validate_identity_pair(
+        v2.user_id.as_deref().or(nested_user.as_deref()),
+        v2.session_id.as_deref().or(nested_session.as_deref()),
+    )?;
     let req = CrawlRequest {
         url: v2.url.clone(),
         max_depth: v2.max_discovery_depth,
@@ -165,6 +191,8 @@ pub async fn start_crawl(
         wait_for: opts.wait_for,
         renderer: v2.renderer,
         country: v2.country,
+        user_id,
+        session_id,
         proxy_list: v2.proxy_list,
         proxy_rotation: v2.proxy_rotation,
         headers: opts.headers,

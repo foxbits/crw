@@ -937,6 +937,14 @@
             "type": "boolean",
             "default": false,
             "description": "Capture the whole page rather than the viewport, for `formats: [\"screenshot\"]`."
+          },
+          "userId": {
+            "type": "string",
+            "description": "Optional sticky user identity for identifying user sessions. Must match ^[A-Za-z0-9._-]+$ (1-128 chars); blank = no sticky identity."
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "Optional sticky session within userId. Only takes effect together with userId; anything else is treated as no sticky identity. Same ^[A-Za-z0-9._-]+$ rule."
           }
         }
       },
@@ -1118,6 +1126,14 @@
           },
           "scrapeOptions": {
             "$ref": "#/components/schemas/ScrapeOptions"
+          },
+          "userId": {
+            "type": "string",
+            "description": "Optional sticky user identity for identifying user sessions. Must match ^[A-Za-z0-9._-]+$ (1-128 chars); blank = no sticky identity."
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "Optional sticky session within userId. Only takes effect together with userId; anything else is treated as no sticky identity. Same ^[A-Za-z0-9._-]+$ rule."
           }
         }
       },
@@ -1691,6 +1707,14 @@
                 "type": "integer",
                 "minimum": 1,
                 "description": "How many URLs the job scrapes concurrently. Clamped server-side to crawler.max_batch_concurrency."
+              },
+              "userId": {
+                "type": "string",
+                "description": "Optional sticky user identity for identifying user sessions. Must match ^[A-Za-z0-9._-]+$ (1-128 chars); blank = no sticky identity."
+              },
+              "sessionId": {
+                "type": "string",
+                "description": "Optional sticky session within userId. Only takes effect together with userId; anything else is treated as no sticky identity. Same ^[A-Za-z0-9._-]+$ rule."
               }
             }
           }

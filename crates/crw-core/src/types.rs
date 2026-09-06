@@ -241,6 +241,15 @@ pub struct ScrapeRequest {
     /// invalid values fall back to default.
     #[serde(default)]
     pub country: Option<String>,
+    /// Optional sticky identity for this request (generic, renderer-agnostic).
+    /// Values must match `^[A-Za-z0-9._-]+$` (1–128 chars); blank ⇒ `None`.
+    #[serde(default, alias = "user_id")]
+    pub user_id: Option<String>,
+    /// Optional sticky session within `user_id` (see `user_id`).
+    // Only takes effect together with `user_id`.
+    // Same `^[A-Za-z0-9._-]+$` rule as `user_id`.
+    #[serde(default, alias = "session_id")]
+    pub session_id: Option<String>,
     /// Override stealth mode for this request (None = use global config).
     #[serde(default)]
     pub stealth: Option<bool>,
@@ -450,6 +459,8 @@ impl Default for ScrapeRequest {
             proxy_list: Vec::new(),
             proxy_rotation: None,
             country: None,
+            user_id: None,
+            session_id: None,
             stealth: None,
             actions: None,
             extract: None,
@@ -1141,6 +1152,14 @@ pub struct CrawlRequest {
     /// every page fetched in this crawl. See `ScrapeRequest::country`.
     #[serde(default)]
     pub country: Option<String>,
+    /// Optional sticky identity applied to every page in this crawl.
+    /// See `ScrapeRequest::user_id`.
+    #[serde(default, alias = "user_id")]
+    pub user_id: Option<String>,
+    /// Optional sticky session applied to every page in this crawl.
+    /// See `ScrapeRequest::session_id`.
+    #[serde(default, alias = "session_id")]
+    pub session_id: Option<String>,
     /// Per-crawl proxy pool to rotate among (BYOP). Takes precedence over the
     /// server's configured pool. Empty = use server config. Rotation is applied
     /// per page (see `proxy_rotation`). Accepts the snake_case `proxy_list` alias.
@@ -1182,6 +1201,61 @@ pub fn resolve_render_js(request: Option<bool>, default: Option<bool>) -> Option
 /// `None` and `Some(Auto)` both return `None` — meaning "use the configured chain".
 pub fn resolve_pinned_renderer(req: Option<RequestedRenderer>) -> Option<&'static str> {
     req.and_then(|r| r.pinned_name())
+}
+
+/// Trim a sticky identity field (`user_id` / `session_id`).
+///
+/// Whitespace-only / empty after trim maps to `None` so an omitted field and
+/// a blank string behave identically.
+pub fn normalize_identity_field(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Validate a sticky identity field after trimming.
+///
+/// Allowlist `^[A-Za-z0-9._-]+$` (1–128 chars, counted in chars not bytes).
+/// Empty-after-trim is `Ok(None)`, not an error, so blank strings keep behavior.
+pub fn validate_identity_field(
+    raw: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, crate::error::CrwError> {
+    match normalize_identity_field(raw) {
+        None => Ok(None),
+        Some(v) => {
+            if v.chars().count() > 128 {
+                return Err(crate::error::CrwError::InvalidRequest(format!(
+                    "'{field}' must be at most 128 characters"
+                )));
+            }
+            // `.` / `..` match the charset but are path segments with special meaning
+            let ok = !v.is_empty()
+                && v != "."
+                && v != ".."
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-');
+            if !ok {
+                return Err(crate::error::CrwError::InvalidRequest(format!(
+                    "'{field}' must match ^[A-Za-z0-9._-]+$ (1-128 chars)"
+                )));
+            }
+            Ok(Some(v))
+        }
+    }
+}
+
+/// Validate a sticky identity pair in one call so every entry point shares a
+/// single rule (scrape, crawl, batch, MCP, v2). Returns
+/// `(user_id, session_id)` after trim + allowlist validation; blank ⇒ `None`.
+pub fn validate_identity_pair(
+    user_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(Option<String>, Option<String>), crate::error::CrwError> {
+    Ok((
+        validate_identity_field(user_id, "userId")?,
+        validate_identity_field(session_id, "sessionId")?,
+    ))
 }
 
 #[cfg(test)]
@@ -2351,6 +2425,142 @@ mod tests {
         });
         let req: ScrapeRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.url, "https://example.com");
+    }
+
+    #[test]
+    fn scrape_request_identity_defaults_to_none() {
+        let req: ScrapeRequest =
+            serde_json::from_value(serde_json::json!({ "url": "https://example.com" })).unwrap();
+        assert_eq!(req.user_id, None);
+        assert_eq!(req.session_id, None);
+        let def = ScrapeRequest::default();
+        assert_eq!(def.user_id, None);
+        assert_eq!(def.session_id, None);
+    }
+
+    #[test]
+    fn scrape_request_identity_camel_and_snake_deserialize() {
+        let req: ScrapeRequest = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com",
+            "userId": "home-alice",
+            "sessionId": "sess-1",
+        }))
+        .unwrap();
+        assert_eq!(req.user_id.as_deref(), Some("home-alice"));
+        assert_eq!(req.session_id.as_deref(), Some("sess-1"));
+
+        let req: ScrapeRequest = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com",
+            "user_id": "home-bob",
+            "session_id": "sess-2",
+        }))
+        .unwrap();
+        assert_eq!(req.user_id.as_deref(), Some("home-bob"));
+        assert_eq!(req.session_id.as_deref(), Some("sess-2"));
+    }
+
+    #[test]
+    fn scrape_request_identity_serializes_camel_case() {
+        let mut req = ScrapeRequest {
+            url: "https://example.com".into(),
+            ..Default::default()
+        };
+        req.user_id = Some("home-alice".into());
+        req.session_id = Some("sess-1".into());
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            json.get("userId").and_then(|v| v.as_str()),
+            Some("home-alice")
+        );
+        assert_eq!(
+            json.get("sessionId").and_then(|v| v.as_str()),
+            Some("sess-1")
+        );
+        assert!(json.get("user_id").is_none());
+        assert!(json.get("session_id").is_none());
+    }
+
+    #[test]
+    fn crawl_request_identity_defaults_to_none_and_aliases_work() {
+        let req: CrawlRequest =
+            serde_json::from_value(serde_json::json!({ "url": "https://example.com" })).unwrap();
+        assert_eq!(req.user_id, None);
+        assert_eq!(req.session_id, None);
+        let req: CrawlRequest = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com",
+            "user_id": "home-alice",
+            "session_id": "sess-1",
+        }))
+        .unwrap();
+        assert_eq!(req.user_id.as_deref(), Some("home-alice"));
+        assert_eq!(req.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn normalize_identity_field_trims_and_blanks_to_none() {
+        assert_eq!(normalize_identity_field(None), None);
+        assert_eq!(normalize_identity_field(Some("   ")), None);
+        assert_eq!(normalize_identity_field(Some("")), None);
+        assert_eq!(
+            normalize_identity_field(Some("  home-alice  ")),
+            Some("home-alice".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_identity_field_enforces_allowlist() {
+        assert_eq!(validate_identity_field(None, "userId").unwrap(), None);
+        // Blank after trim is not an error — it means "not provided".
+        assert_eq!(
+            validate_identity_field(Some("   "), "userId").unwrap(),
+            None
+        );
+        assert_eq!(
+            validate_identity_field(Some(" home-alice "), "userId").unwrap(),
+            Some("home-alice".to_string())
+        );
+        assert_eq!(
+            validate_identity_field(Some("a.b_c-d9"), "sessionId").unwrap(),
+            Some("a.b_c-d9".to_string())
+        );
+        // Path separators, query/fragment delimiters, encoding tricks,
+        // traversal segments, spaces, controls and non-ASCII are rejected.
+        for bad in [
+            "a/b",
+            "a\\b",
+            "a?b",
+            "a#b",
+            "a%2Fb",
+            "..",
+            ".",
+            "a b",
+            "a\u{0007}b",
+            "café",
+            "a@b",
+        ] {
+            assert!(
+                validate_identity_field(Some(bad), "userId").is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        assert!(validate_identity_field(Some(&"x".repeat(129)), "userId").is_err());
+        assert!(validate_identity_field(Some(&"x".repeat(128)), "userId").is_ok());
+    }
+
+    #[test]
+    fn validate_identity_pair_validates_both_fields_together() {
+        let (u, s) = validate_identity_pair(Some("home-alice"), Some("sess-1")).unwrap();
+        assert_eq!(u.as_deref(), Some("home-alice"));
+        assert_eq!(s.as_deref(), Some("sess-1"));
+        let (u, s) = validate_identity_pair(None, None).unwrap();
+        assert_eq!(u, None);
+        assert_eq!(s, None);
+        // A lone sessionId passes validation (downgraded downstream, not a 400).
+        let (u, s) = validate_identity_pair(None, Some("sess-1")).unwrap();
+        assert_eq!(u, None);
+        assert_eq!(s.as_deref(), Some("sess-1"));
+        assert!(validate_identity_pair(Some("bad/user"), Some("sess-1")).is_err());
+        assert!(validate_identity_pair(Some("home-alice"), Some("bad sess")).is_err());
     }
 
     #[test]

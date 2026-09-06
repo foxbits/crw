@@ -799,6 +799,8 @@ fn build_request(
         proxy_list: Vec::new(),
         proxy_rotation: None,
         country: None,
+        user_id: None,
+        session_id: None,
         stealth: if stealth { Some(true) } else { None },
         actions: None,
         extract,

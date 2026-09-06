@@ -1177,6 +1177,8 @@ mod tests {
             wait_for: None,
             renderer,
             country: None,
+            user_id: None,
+            session_id: None,
             proxy_list: Vec::new(),
             proxy_rotation: None,
             headers: std::collections::HashMap::new(),

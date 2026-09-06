@@ -1373,6 +1373,14 @@
             "type": "string",
             "description": "2-letter ISO 3166-1 alpha-2 country code for residential proxy egress (e.g. 'us', 'gb')"
           },
+          "userId": {
+            "type": "string",
+            "description": "Optional sticky user identity for identifying user sessions. Must match ^[A-Za-z0-9._-]+$ (1-128 chars); blank = no sticky identity."
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "Optional sticky session within userId. Only takes effect together with userId; anything else is treated as no sticky identity. Same ^[A-Za-z0-9._-]+$ rule."
+          },
           "stealth": {
             "type": "boolean",
             "description": "Override stealth mode for this request (null = use global config)"
@@ -1755,6 +1763,14 @@
           "country": {
             "type": "string",
             "description": "2-letter ISO 3166-1 alpha-2 proxy egress country."
+          },
+          "userId": {
+            "type": "string",
+            "description": "Optional sticky user identity for identifying user sessions. Must match ^[A-Za-z0-9._-]+$ (1-128 chars); blank = no sticky identity."
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "Optional sticky session within userId. Only takes effect together with userId; anything else is treated as no sticky identity. Same ^[A-Za-z0-9._-]+$ rule."
           },
           "proxyList": {
             "type": "array",
@@ -2427,6 +2443,14 @@
           "onlyMainContent": {
             "type": "boolean",
             "default": true
+          },
+          "userId": {
+            "type": "string",
+            "description": "Optional sticky user identity for identifying user sessions. Must match ^[A-Za-z0-9._-]+$ (1-128 chars); blank = no sticky identity."
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "Optional sticky session within userId. Only takes effect together with userId; anything else is treated as no sticky identity. Same ^[A-Za-z0-9._-]+$ rule."
           }
         }
       },
@@ -2541,6 +2565,14 @@
               "type": "string"
             },
             "description": "Custom HTTP request headers applied to every page the crawl fetches. On a browser render they apply to every request the page makes, subresources included, so avoid cross-origin-sensitive credentials here."
+          },
+          "userId": {
+            "type": "string",
+            "description": "Optional sticky user identity for identifying user sessions. Must match ^[A-Za-z0-9._-]+$ (1-128 chars); blank = no sticky identity."
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "Optional sticky session within userId. Only takes effect together with userId; anything else is treated as no sticky identity. Same ^[A-Za-z0-9._-]+$ rule."
           }
         }
       }
