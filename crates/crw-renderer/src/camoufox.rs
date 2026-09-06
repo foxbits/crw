@@ -14,11 +14,15 @@
 //! ## Sequence (per request, fresh session — no cookie carry-over)
 //! 1. `POST {base}/tabs` `{userId, sessionKey, url}` → `{tabId, url}` (the
 //!    `url` body navigates the new tab as it is created).
-//! 2. `POST {base}/tabs/{tabId}/evaluate` `{userId, expression}` with
+//! 2. `POST {base}/tabs/{tabId}/wait` `{userId, timeout}` → `{ok, ready}`
+//!    (best-effort — `waitForPageReady`: `domcontentloaded` + `networkidle` +
+//!    hydration poll + settle — so JS has finished before we read the DOM;
+//!    any failure proceeds to step 3 anyway).
+//! 3. `POST {base}/tabs/{tabId}/evaluate` `{userId, expression}` with
 //!    `expression = "document.documentElement.outerHTML"` → `{ok, result}`.
 //!    `result` is the fully JS-rendered DOM string — exactly what CRW's
 //!    post-render pipeline (`only_main_content`, tag filters, markdown) needs.
-//! 3. `DELETE {base}/sessions/{userId}` — ALWAYS, even on error, so the sidecar
+//! 4. `DELETE {base}/sessions/{userId}` — ALWAYS, even on error, so the sidecar
 //!    never leaks a server-side session.
 //!
 //! The endpoint contract above is from the camofox-browser `openapi.json`.
@@ -40,6 +44,22 @@ const OUTER_HTML_EXPR: &str = "document.documentElement.outerHTML";
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Budget for the `is_available` health probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default server-side budget (ms) sent as `timeout` to `POST
+/// /tabs/{tabId}/wait` when the caller did not supply `wait_for_ms`. Mirrors
+/// the camofox-browser default (`timeout = 10000` in `server.js`): covers
+/// `domcontentloaded` + up-to-5s `networkidle` + hydration poll (capped at
+/// `min(timeout, 10000)`) + settle.
+const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
+
+/// Compute the server-side `timeout` to send to `POST /tabs/{tabId}/wait`:
+/// the caller's `wait_for_ms` when present, else [`DEFAULT_WAIT_TIMEOUT_MS`],
+/// clamped to the current call budget so the wait can never overrun the
+/// request deadline. Pure function so the clamping is unit-testable without
+/// HTTP mocks.
+fn wait_timeout_ms(wait_for_ms: Option<u64>, budget: Duration) -> u64 {
+    let desired = wait_for_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
+    (budget.as_millis().min(desired as u128)) as u64
+}
 
 /// Opt-in Camoufox stealth renderer. Construct via [`CamoufoxRenderer::new`].
 pub struct CamoufoxRenderer {
@@ -154,6 +174,75 @@ impl CamoufoxRenderer {
         ))
     }
 
+    /// Best-effort wait for the page to finish loading and executing JS via
+    /// `POST {base}/tabs/{tabId}/wait` (`waitForPageReady` server-side:
+    /// `domcontentloaded` + `networkidle` + hydration poll + settle).
+    ///
+    /// FAIL-OPEN by design: every failure mode — expired budget (wait is
+    /// skipped), transport/timeout/non-2xx error, `ok=false`, or
+    /// `ready=false` (page did not fully settle) — only logs and returns, so
+    /// the caller always proceeds to `evaluate_outer_html` with whatever DOM
+    /// exists. A partially-rendered page is strictly better than no page.
+    ///
+    /// Body is `{userId, timeout}` only. The sidecar's `/wait` handler
+    /// (`server.js`) destructures just `{userId, timeout, waitForNetwork,
+    /// dismissConsent}` and looks the tab up by `userId` + `tabId`, so
+    /// `sessionKey` is intentionally omitted (the server would ignore it).
+    /// `timeout` is [`wait_timeout_ms`]: `wait_for_ms` when the caller
+    /// supplied one, else [`DEFAULT_WAIT_TIMEOUT_MS`], clamped to the
+    /// remaining call budget (which is itself `min(deadline.remaining(),
+    /// camoufox_timeout)`). [`Self::post_json`] recomputes that same budget as
+    /// the HTTP timeout, so the two agree modulo microseconds of clock drift;
+    /// a client-side timeout firing marginally first is fail-open anyway.
+    async fn wait_for_ready(
+        &self,
+        tab_id: &str,
+        user_id: &str,
+        wait_for_ms: Option<u64>,
+        deadline: &Deadline,
+    ) {
+        let budget = self.call_budget(deadline);
+        if budget.is_zero() {
+            tracing::debug!(
+                renderer = %self.name,
+                tab_id,
+                "skipping camoufox wait: deadline exhausted (fail-open)"
+            );
+            return;
+        }
+        let timeout_ms = wait_timeout_ms(wait_for_ms, budget);
+        if timeout_ms == 0 {
+            return;
+        }
+        let body = serde_json::json!({
+            "userId": user_id,
+            "timeout": timeout_ms,
+        });
+        match self
+            .post_json(&format!("/tabs/{tab_id}/wait"), &body, deadline)
+            .await
+        {
+            Ok(value) => {
+                let ok = value.get("ok").and_then(|o| o.as_bool()).unwrap_or(true);
+                let ready = value.get("ready").and_then(|r| r.as_bool()).unwrap_or(true);
+                if !ok || !ready {
+                    tracing::debug!(
+                        renderer = %self.name,
+                        tab_id,
+                        ok,
+                        ready,
+                        "camoufox wait settled without ready (fail-open, proceeding to evaluate)"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                renderer = %self.name,
+                tab_id,
+                "camoufox wait failed (fail-open, proceeding to evaluate): {e}"
+            ),
+        }
+    }
+
     /// Evaluate `document.documentElement.outerHTML` and return the DOM string.
     async fn evaluate_outer_html(
         &self,
@@ -202,7 +291,7 @@ impl CamoufoxRenderer {
         }
     }
 
-    /// Full create → evaluate sequence with GUARANTEED cleanup. The inner
+    /// Full create → wait → evaluate sequence with GUARANTEED cleanup. The inner
     /// result is bound first, then `destroy_session` runs at statement level so
     /// it fires on both the Ok and Err paths, and only afterward is the result
     /// returned.
@@ -211,10 +300,11 @@ impl CamoufoxRenderer {
         url: &str,
         user_id: &str,
         session_key: &str,
+        wait_for_ms: Option<u64>,
         deadline: &Deadline,
     ) -> CrwResult<(u16, String)> {
         let inner = self
-            .run_sequence_inner(url, user_id, session_key, deadline)
+            .run_sequence_inner(url, user_id, session_key, wait_for_ms, deadline)
             .await;
         self.destroy_session(user_id).await;
         inner
@@ -225,9 +315,14 @@ impl CamoufoxRenderer {
         url: &str,
         user_id: &str,
         session_key: &str,
+        wait_for_ms: Option<u64>,
         deadline: &Deadline,
     ) -> CrwResult<(u16, String)> {
         let tab_id = self.create_tab(url, user_id, session_key, deadline).await?;
+        // Best-effort: never errors — on any wait failure the evaluate below
+        // still runs against whatever DOM exists.
+        self.wait_for_ready(&tab_id, user_id, wait_for_ms, deadline)
+            .await;
         let html = self.evaluate_outer_html(&tab_id, user_id, deadline).await?;
         // A bot wall or an empty body is a failure for THIS tier — surface it as
         // a retryable RendererError so the fallback loop / breaker can react.
@@ -274,7 +369,7 @@ impl PageFetcher for CamoufoxRenderer {
         &self,
         url: &str,
         _headers: &HashMap<String, String>,
-        _wait_for_ms: Option<u64>,
+        wait_for_ms: Option<u64>,
         deadline: Deadline,
     ) -> CrwResult<FetchResult> {
         if deadline.expired() {
@@ -284,7 +379,7 @@ impl PageFetcher for CamoufoxRenderer {
         let user_id = Self::rand_id("crw_");
         let session_key = Self::rand_id("task_");
         let (status, html) = self
-            .run_sequence(url, &user_id, &session_key, &deadline)
+            .run_sequence(url, &user_id, &session_key, wait_for_ms, &deadline)
             .await?;
 
         Ok(FetchResult {
@@ -387,6 +482,40 @@ mod tests {
             .await;
     }
 
+    /// Mock a successful best-effort wait: `POST /tabs/{tab_id}/wait` →
+    /// `{ok: true, ready: true}`. Body-agnostic (any `userId`/`timeout`) so
+    /// per-request random IDs do not need matching; timeout-value propagation
+    /// is covered by the pure `wait_timeout_ms` unit tests below.
+    async fn mount_wait_ok(server: &MockServer, tab_id: &str) {
+        mount_wait_body(
+            server,
+            tab_id,
+            serde_json::json!({"ok": true, "ready": true}),
+        )
+        .await;
+    }
+
+    async fn mount_wait_body(server: &MockServer, tab_id: &str, body: serde_json::Value) {
+        Mock::given(method("POST"))
+            .and(path(format!("/tabs/{tab_id}/wait")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// Mount a wait mock that MUST fire exactly once — use on the happy path
+    /// to prove the fetch sequence actually waits before evaluating.
+    async fn mount_wait_ok_expect_once(server: &MockServer, tab_id: &str) {
+        Mock::given(method("POST"))
+            .and(path(format!("/tabs/{tab_id}/wait")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "ready": true
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test]
     async fn happy_path_returns_html_and_cleans_up() {
         let server = MockServer::start().await;
@@ -397,6 +526,8 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        // Best-effort wait between navigation and evaluate — must fire once.
+        mount_wait_ok_expect_once(&server, "t1").await;
         Mock::given(method("POST"))
             .and(path("/tabs/t1/evaluate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -421,7 +552,7 @@ mod tests {
         assert_eq!(res.rendered_with.as_deref(), Some("camoufox"));
         assert_eq!(res.status_code, 200);
         assert!(res.html.contains("real content"));
-        // server drop verifies the expect(1) on the DELETE mock
+        // server drop verifies the expect(1) on the wait + DELETE mocks
     }
 
     #[tokio::test]
@@ -434,6 +565,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_wait_ok(&server, "t1").await;
         Mock::given(method("POST"))
             .and(path("/tabs/t1/evaluate"))
             .respond_with(
@@ -456,8 +588,8 @@ mod tests {
         assert!(matches!(err, CrwError::RendererError(_)));
     }
 
-    /// Helper: mock create-tab OK + evaluate returning `eval_body`, with a
-    /// cleanup mock that MUST fire once. Returns the started server.
+    /// Helper: mock create-tab OK + wait OK + evaluate returning `eval_body`,
+    /// with a cleanup mock that MUST fire once. Returns the started server.
     async fn server_with_evaluate(eval_body: serde_json::Value) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -467,6 +599,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_wait_ok(&server, "t1").await;
         Mock::given(method("POST"))
             .and(path("/tabs/t1/evaluate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(eval_body))
@@ -531,6 +664,15 @@ mod tests {
             .expect(2) // first attempt + one retry
             .mount(&server)
             .await;
+        // Wait must never fire: create-tab never produced a tabId.
+        Mock::given(method("POST"))
+            .and(path("/tabs/t1/wait"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "ready": true
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
         mount_delete_session(&server).await;
 
         let r = renderer(&server.uri());
@@ -554,6 +696,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_wait_ok(&server, "t1").await;
         Mock::given(method("POST"))
             .and(path("/tabs/t1/evaluate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -573,6 +716,133 @@ mod tests {
             CrwError::RendererError(m) => assert!(m.contains("challenge")),
             other => panic!("expected RendererError, got {other:?}"),
         }
+    }
+
+    /// Fail-open: `ready=false` means the page did not fully settle, but the
+    /// fetch must still return whatever DOM `evaluate` produces.
+    #[tokio::test]
+    async fn wait_ready_false_still_returns_html() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tabs"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tabId": "t1"})),
+            )
+            .mount(&server)
+            .await;
+        mount_wait_body(
+            &server,
+            "t1",
+            serde_json::json!({"ok": true, "ready": false}),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/tabs/t1/evaluate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": "<html><body>late-hydrated content after unsettled wait</body></html>"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_delete_session(&server).await;
+
+        let res = renderer(&server.uri())
+            .fetch("https://example.com", &HashMap::new(), None, deadline())
+            .await
+            .expect("ready=false must not fail the fetch");
+        assert!(res.html.contains("late-hydrated"));
+    }
+
+    /// Fail-open: a transport-level wait failure (HTTP 500 here; timeouts and
+    /// 404s take the same path) must not fail the fetch — evaluate still runs
+    /// and cleanup still fires.
+    #[tokio::test]
+    async fn wait_http_error_is_fail_open() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tabs"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tabId": "t1"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/tabs/t1/wait"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({"error": "boom"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/tabs/t1/evaluate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": "<html><body>content despite wait transport failure</body></html>"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/sessions/.+"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let res = renderer(&server.uri())
+            .fetch("https://example.com", &HashMap::new(), None, deadline())
+            .await
+            .expect("wait 500 must not fail the fetch");
+        assert!(res.html.contains("despite wait"));
+    }
+
+    /// Fail-open: `ok=false` from `/wait` (unexpected per the sidecar
+    /// contract, which always returns `ok:true` here) still proceeds.
+    #[tokio::test]
+    async fn wait_ok_false_still_returns_html() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tabs"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tabId": "t1"})),
+            )
+            .mount(&server)
+            .await;
+        mount_wait_body(&server, "t1", serde_json::json!({"ok": false})).await;
+        Mock::given(method("POST"))
+            .and(path("/tabs/t1/evaluate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": "<html><body>content despite ok=false wait</body></html>"
+            })))
+            .mount(&server)
+            .await;
+        mount_delete_session(&server).await;
+
+        let res = renderer(&server.uri())
+            .fetch("https://example.com", &HashMap::new(), None, deadline())
+            .await
+            .expect("wait ok=false must not fail the fetch");
+        assert!(res.html.contains("despite ok=false"));
+    }
+
+    #[test]
+    fn wait_timeout_uses_wait_for_ms_else_default_clamped_to_budget() {
+        // No caller preference → server default.
+        assert_eq!(
+            wait_timeout_ms(None, Duration::from_secs(30)),
+            DEFAULT_WAIT_TIMEOUT_MS
+        );
+        // Caller preference wins when budget allows.
+        assert_eq!(wait_timeout_ms(Some(2_000), Duration::from_secs(30)), 2_000);
+        // Clamped to the remaining budget so the wait never overruns the
+        // request deadline.
+        assert_eq!(wait_timeout_ms(None, Duration::from_millis(500)), 500);
+        assert_eq!(wait_timeout_ms(Some(20_000), Duration::from_secs(5)), 5_000);
+        // Zero budget → zero (the caller skips the wait entirely).
+        assert_eq!(wait_timeout_ms(None, Duration::ZERO), 0);
     }
 
     #[tokio::test]
