@@ -17,7 +17,8 @@
 //! 2. `POST {base}/tabs/{tabId}/wait` `{userId, timeout}` → `{ok, ready}`
 //!    (best-effort — `waitForPageReady`: `domcontentloaded` + `networkidle` +
 //!    hydration poll + settle — so JS has finished before we read the DOM;
-//!    any failure proceeds to step 3 anyway).
+//!    any failure proceeds to step 3 anyway; skipped entirely when
+//!    `[renderer.camoufox] wait_enabled = false`).
 //! 3. `POST {base}/tabs/{tabId}/evaluate` `{userId, expression}` with
 //!    `expression = "document.documentElement.outerHTML"` → `{ok, result}`.
 //!    `result` is the fully JS-rendered DOM string — exactly what CRW's
@@ -44,21 +45,16 @@ const OUTER_HTML_EXPR: &str = "document.documentElement.outerHTML";
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Budget for the `is_available` health probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Default server-side budget (ms) sent as `timeout` to `POST
-/// /tabs/{tabId}/wait` when the caller did not supply `wait_for_ms`. Mirrors
-/// the camofox-browser default (`timeout = 10000` in `server.js`): covers
-/// `domcontentloaded` + up-to-5s `networkidle` + hydration poll (capped at
-/// `min(timeout, 10000)`) + settle.
-const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
 
 /// Compute the server-side `timeout` to send to `POST /tabs/{tabId}/wait`:
-/// the caller's `wait_for_ms` when present, else [`DEFAULT_WAIT_TIMEOUT_MS`],
-/// clamped to the current call budget so the wait can never overrun the
-/// request deadline. Pure function so the clamping is unit-testable without
-/// HTTP mocks.
+/// the caller's `wait_for_ms` when present, else the full current call budget
+/// (itself `min(deadline.remaining(), camoufox_timeout)` — the same budget
+/// every other Camoufox REST call uses), clamped so the wait can never
+/// overrun the request deadline. Pure function so the clamping is
+/// unit-testable without HTTP mocks.
 fn wait_timeout_ms(wait_for_ms: Option<u64>, budget: Duration) -> u64 {
-    let desired = wait_for_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
-    (budget.as_millis().min(desired as u128)) as u64
+    let budget_ms = budget.as_millis().min(u64::MAX as u128) as u64;
+    wait_for_ms.map(|w| w.min(budget_ms)).unwrap_or(budget_ms)
 }
 
 /// Opt-in Camoufox stealth renderer. Construct via [`CamoufoxRenderer::new`].
@@ -70,16 +66,25 @@ pub struct CamoufoxRenderer {
     api_key: String,
     /// Overall per-request REST budget (`config.camoufox_timeout()`).
     timeout: Duration,
+    /// Whether the best-effort `POST /tabs/{tabId}/wait` runs
+    wait_enabled: bool,
     client: reqwest::Client,
 }
 
 impl CamoufoxRenderer {
-    pub fn new(name: &str, base_url: &str, api_key: &str, timeout_ms: u64) -> Self {
+    pub fn new(
+        name: &str,
+        base_url: &str,
+        api_key: &str,
+        timeout_ms: u64,
+        wait_enabled: bool,
+    ) -> Self {
         Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             timeout: Duration::from_millis(timeout_ms),
+            wait_enabled,
             client: reqwest::Client::new(),
         }
     }
@@ -189,11 +194,15 @@ impl CamoufoxRenderer {
     /// dismissConsent}` and looks the tab up by `userId` + `tabId`, so
     /// `sessionKey` is intentionally omitted (the server would ignore it).
     /// `timeout` is [`wait_timeout_ms`]: `wait_for_ms` when the caller
-    /// supplied one, else [`DEFAULT_WAIT_TIMEOUT_MS`], clamped to the
-    /// remaining call budget (which is itself `min(deadline.remaining(),
-    /// camoufox_timeout)`). [`Self::post_json`] recomputes that same budget as
-    /// the HTTP timeout, so the two agree modulo microseconds of clock drift;
-    /// a client-side timeout firing marginally first is fail-open anyway.
+    /// supplied one, else the full call budget (which is itself
+    /// `min(deadline.remaining(), camoufox_timeout)` — the same budget every
+    /// other Camoufox REST call uses). [`Self::post_json`] recomputes that
+    /// same budget as the HTTP timeout, so the two agree modulo microseconds
+    /// of clock drift; a client-side timeout firing marginally first is
+    /// fail-open anyway.
+    ///
+    /// Skipped entirely when `[renderer.camoufox] wait_enabled = false` — the
+    /// caller proceeds straight to `evaluate_outer_html`.
     async fn wait_for_ready(
         &self,
         tab_id: &str,
@@ -201,6 +210,14 @@ impl CamoufoxRenderer {
         wait_for_ms: Option<u64>,
         deadline: &Deadline,
     ) {
+        if !self.wait_enabled {
+            tracing::debug!(
+                renderer = %self.name,
+                tab_id,
+                "skipping camoufox wait: disabled via wait_enabled (proceeding to evaluate)"
+            );
+            return;
+        }
         let budget = self.call_budget(deadline);
         if budget.is_zero() {
             tracing::debug!(
@@ -431,7 +448,11 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn renderer(base_url: &str) -> CamoufoxRenderer {
-        CamoufoxRenderer::new("camoufox", base_url, "", 30_000)
+        CamoufoxRenderer::new("camoufox", base_url, "", 30_000, true)
+    }
+
+    fn renderer_with_wait(base_url: &str, wait_enabled: bool) -> CamoufoxRenderer {
+        CamoufoxRenderer::new("camoufox", base_url, "", 30_000, wait_enabled)
     }
 
     fn deadline() -> Deadline {
@@ -829,20 +850,56 @@ mod tests {
     }
 
     #[test]
-    fn wait_timeout_uses_wait_for_ms_else_default_clamped_to_budget() {
-        // No caller preference → server default.
-        assert_eq!(
-            wait_timeout_ms(None, Duration::from_secs(30)),
-            DEFAULT_WAIT_TIMEOUT_MS
-        );
-        // Caller preference wins when budget allows.
-        assert_eq!(wait_timeout_ms(Some(2_000), Duration::from_secs(30)), 2_000);
-        // Clamped to the remaining budget so the wait never overruns the
-        // request deadline.
+    fn wait_timeout_uses_wait_for_ms_else_full_budget() {
+        // No caller preference → full call budget (the same budget every other
+        // Camoufox REST call uses).
+        assert_eq!(wait_timeout_ms(None, Duration::from_secs(30)), 30_000);
         assert_eq!(wait_timeout_ms(None, Duration::from_millis(500)), 500);
+        // Caller preference wins when budget allows, else clamped so the wait
+        // never overruns the request deadline.
+        assert_eq!(wait_timeout_ms(Some(2_000), Duration::from_secs(30)), 2_000);
         assert_eq!(wait_timeout_ms(Some(20_000), Duration::from_secs(5)), 5_000);
         // Zero budget → zero (the caller skips the wait entirely).
         assert_eq!(wait_timeout_ms(None, Duration::ZERO), 0);
+    }
+
+    /// Disabled wait must skip `POST /tabs/{id}/wait` entirely and still
+    /// evaluate + clean up.
+    #[tokio::test]
+    async fn wait_disabled_skips_wait_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tabs"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tabId": "t1"})),
+            )
+            .mount(&server)
+            .await;
+        // Wait must never fire when disabled.
+        Mock::given(method("POST"))
+            .and(path("/tabs/t1/wait"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "ready": true
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/tabs/t1/evaluate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": "<html><body>content without wait</body></html>"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_delete_session(&server).await;
+
+        let res = renderer_with_wait(&server.uri(), false)
+            .fetch("https://example.com", &HashMap::new(), None, deadline())
+            .await
+            .expect("disabled wait must still return evaluate HTML");
+        assert!(res.html.contains("without wait"));
     }
 
     #[tokio::test]

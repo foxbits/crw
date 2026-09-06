@@ -228,14 +228,15 @@ configured endpoint stays out of the `auto` failover chain until you ask for it.
 
 3. The endpoint in your config:
 
-   ```toml
-   [renderer.camoufox]
-   base_url = "http://127.0.0.1:9377"
-   # api_key = "..."             # sent as `Authorization: Bearer` — only needed
-   #                             # if you front the sidecar with an auth proxy
-   # include_in_auto = false     # default: stay OUT of the auto ladder
-   # camoufox_timeout_ms = 60000 # per-request REST budget (default 60s)
-   ```
+    ```toml
+    [renderer.camoufox]
+    base_url = "http://127.0.0.1:9377"
+    # api_key = "..."             # sent as `Authorization: Bearer` — only needed
+    #                             # if you front the sidecar with an auth proxy
+    # include_in_auto = false     # default: stay OUT of the auto ladder
+    # wait_enabled = true         # default: run POST /tabs/{id}/wait before evaluate
+    # camoufox_timeout_ms = 60000 # per-request REST budget (default 60s)
+    ```
 
 ### Three ways to use it
 

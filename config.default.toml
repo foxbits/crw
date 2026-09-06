@@ -65,6 +65,7 @@ ws_url = "ws://127.0.0.1:9222/"
 # base_url = "http://127.0.0.1:9377"
 # api_key = ""                 # optional bearer token if the sidecar is protected
 # include_in_auto = false      # default: stay out of the auto ladder
+# wait_enabled = true          # default: run POST /tabs/{id}/wait before evaluate; false skips straight to evaluate
 # camoufox_timeout_ms = 60000  # optional per-request REST budget override
 
 [crawler]

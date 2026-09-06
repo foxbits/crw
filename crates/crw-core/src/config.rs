@@ -1354,7 +1354,7 @@ pub struct CdpEndpoint {
 /// "camoufox"` pin, and additionally joins the Auto ladder ONLY when
 /// `include_in_auto = true`. A configured endpoint with the default
 /// `include_in_auto = false` does NOT change the existing auto ladder.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CamoufoxEndpoint {
     /// Base URL of the camofox-browser REST server, e.g. `http://localhost:9377`.
     pub base_url: String,
@@ -1367,6 +1367,30 @@ pub struct CamoufoxEndpoint {
     /// `mode = "camoufox"`.
     #[serde(default)]
     pub include_in_auto: bool,
+    /// Whether the best-effort `POST /tabs/{tabId}/wait` (`waitForPageReady`:
+    /// `domcontentloaded` + `networkidle` + hydration poll + settle) runs
+    /// between navigation and `evaluate(outerHTML)`. Default `true`.
+    /// Setting it to 'false' makes SPA-only sites return empty results.
+    ///
+    /// TOML: `[renderer.camoufox] wait_enabled`. Env:
+    /// `CRW_RENDERER__CAMOUFOX__WAIT_ENABLED`.
+    #[serde(default = "default_camoufox_wait_enabled")]
+    pub wait_enabled: bool,
+}
+
+impl Default for CamoufoxEndpoint {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            api_key: String::new(),
+            include_in_auto: false,
+            wait_enabled: default_camoufox_wait_enabled(),
+        }
+    }
+}
+
+fn default_camoufox_wait_enabled() -> bool {
+    true
 }
 
 /// Endpoint for the "cloak" Turnstile-solver sidecar (a `cloudflarebypassforscraping`
@@ -2074,6 +2098,7 @@ mod tests {
             "CRW_RENDERER__CAMOUFOX__BASE_URL",
             "CRW_RENDERER__CAMOUFOX__API_KEY",
             "CRW_RENDERER__CAMOUFOX__INCLUDE_IN_AUTO",
+            "CRW_RENDERER__CAMOUFOX__WAIT_ENABLED",
             "CRW_SERVER__PORT",
         ] {
             unsafe { std::env::remove_var(k) };
@@ -2155,6 +2180,7 @@ mod tests {
             base_url: "http://localhost:9377".into(),
             api_key: String::new(),
             include_in_auto: false,
+            ..Default::default()
         };
         // (1) configured + Auto + include_in_auto=false -> NOT in auto ladder.
         let c = RendererConfig {
@@ -2235,6 +2261,7 @@ mod tests {
                 base_url: "http://localhost:9377".into(),
                 api_key: String::new(),
                 include_in_auto: true,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2281,6 +2308,7 @@ mod tests {
             base_url: "http://localhost:9377".into(),
             api_key: String::new(),
             include_in_auto: true,
+            ..Default::default()
         });
         let d = app.effective_deadline_ms(None, None);
         let floor = app.renderer.http_timeout() + app.renderer.camoufox_timeout();
@@ -3227,6 +3255,7 @@ search_backend_url = "http://from-file:8080"
         assert_eq!(c.base_url, "");
         assert_eq!(c.api_key, "");
         assert!(!c.include_in_auto);
+        assert!(c.wait_enabled, "wait is enabled by default");
     }
 
     #[test]
@@ -3235,6 +3264,33 @@ search_backend_url = "http://from-file:8080"
         assert_eq!(c.base_url, "http://cam:9377");
         assert_eq!(c.api_key, "", "api_key must default to empty string");
         assert!(!c.include_in_auto);
+        assert!(c.wait_enabled, "wait_enabled must default to true");
+    }
+
+    #[test]
+    fn camoufox_endpoint_toml_parse_wait_enabled_false() {
+        let c: CamoufoxEndpoint = toml::from_str(
+            r#"
+            base_url = "http://cam:9377"
+            wait_enabled = false
+            "#,
+        )
+        .unwrap();
+        assert!(!c.wait_enabled);
+    }
+
+    #[test]
+    fn env_var_camoufox_wait_enabled() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_renderer_env();
+        unsafe {
+            std::env::set_var("CRW_RENDERER__CAMOUFOX__BASE_URL", "http://cam:9377");
+            std::env::set_var("CRW_RENDERER__CAMOUFOX__WAIT_ENABLED", "false");
+        }
+        let cfg = AppConfig::load().unwrap();
+        clear_renderer_env();
+        let cam = cfg.renderer.camoufox.expect("endpoint must exist");
+        assert!(!cam.wait_enabled);
     }
 
     #[test]

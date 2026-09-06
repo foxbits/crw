@@ -991,10 +991,12 @@ impl FallbackRenderer {
                     &cf.base_url,
                     &cf.api_key,
                     config.camoufox_timeout(),
+                    cf.wait_enabled,
                 )) as Arc<dyn PageFetcher>);
                 tracing::info!(
                     base_url = %cf.base_url,
                     include_in_auto = cf.include_in_auto,
+                    wait_enabled = cf.wait_enabled,
                     "camoufox tier enabled"
                 );
             } else if matches!(config.mode, RendererMode::Camoufox) {
@@ -3750,6 +3752,7 @@ mod tests {
                 base_url: "http://127.0.0.1:9377".into(),
                 api_key: String::new(),
                 include_in_auto,
+                ..Default::default()
             }),
             ..Default::default()
         }
@@ -6632,6 +6635,7 @@ mod tests {
                 base_url: "http://127.0.0.1:9377".into(),
                 api_key: String::new(),
                 include_in_auto: true,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -6652,6 +6656,7 @@ mod tests {
                 base_url: "http://127.0.0.1:9377".into(),
                 api_key: String::new(),
                 include_in_auto: false,
+                ..Default::default()
             }),
             ..Default::default()
         };
